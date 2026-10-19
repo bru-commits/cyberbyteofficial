@@ -1,0 +1,33 @@
+CyberBot Source-Available License (All Rights Reserved)
+
+Copyright (c) 2026 [YOUR NAME OR CYBERBYTE]. All rights reserved.
+
+This source code is published so that people can read it and see how CyberBot
+handles reports and data. Publication is for transparency only and is NOT an
+open source release.
+
+You MAY:
+  - Read and inspect this source code.
+  - Quote short excerpts when discussing, reviewing or reporting problems with
+    the bot, with credit to the copyright holder.
+  - Report security issues or bugs to the copyright holder.
+
+You MAY NOT, without prior written permission from the copyright holder:
+  - Copy, run, host or deploy this code, in whole or in part, including as a
+    bot on Discord or any other platform.
+  - Modify, adapt or create derivative works from it.
+  - Distribute, sublicense, sell or republish it, in whole or in part.
+  - Use its name, branding or messages to present another bot as CyberBot or as
+    affiliated with the copyright holder.
+
+No license or other right is granted except as stated above. All other rights
+are reserved by the copyright holder.
+
+DISCLAIMER
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
