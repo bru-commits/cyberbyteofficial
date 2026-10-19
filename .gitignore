@@ -1,0 +1,12 @@
+# Secrets and private data: never publish these
+.env
+*.db
+*.db-journal
+scammers.json
+.scammers-*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
