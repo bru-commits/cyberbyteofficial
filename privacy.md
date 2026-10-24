@@ -3,7 +3,7 @@ Version 1.1.0 · Last updated 23 October 2026
 CyberBot is a Discord bot run by CyberByte. It exists to help communities deal with scams and cyberbullying. This page says what it stores, why, who can see it, and how long it is kept.
 > **Early access notice:** CyberBot is in early access. **All data described below is currently kept and cannot yet be deleted on request.** There is no delete or purge feature, and we are not able to process deletion requests at this time. Please read the "Retention" section before you use the bot.
 Who is responsible
-CyberByte (the bot's owner and sole reviewer) decides what is stored and why. Contact: [ADD A CONTACT: a Discord server invite, username or email].
+CyberByte (the bot's owner and sole reviewer) decides what is stored and why. Contact: bruno09213 on discord.
 What CyberBot stores
 When someone files a report
 The reporter's Discord user ID.
@@ -43,7 +43,7 @@ Audit logs: a ban in the CyberByte server is recorded in that server's audit log
 Public warnings: for confirmed scam cases only, a warning naming the user and their ID may be posted in the warnings channel. Harassment cases are never announced publicly.
 Discord: the bot runs on Discord, which handles its own data under Discord's own terms and privacy policy.
 Where it is kept
-Case data is in a database file on the machine that hosts the bot, and the blacklist is a JSON file next to it. [Describe your hosting and backups here if you want to.]
+Case data is in a database file on the machine that hosts the bot, and the blacklist is a JSON file next to it. 
 Evidence images and case posts are in a private Discord forum that only reviewers can access.
 Access to the host and to the forum is limited to the bot's owner and reviewers.
 Retention (early access)
