@@ -8,7 +8,7 @@ CyberBot is a Discord bot run by CyberByte. It exists to help communities deal w
 
 ## Who is responsible
 
-CyberByte (the bot's owner and sole reviewer) decides what is stored and why. Contact: **[ADD A CONTACT: a Discord server invite, username or email]**.
+CyberByte Network™ (the bot's owner and sole reviewer) decides what is stored and why. Contact: [cyberbyte.network@outlook.com](mailto:cyberbyte.network@outlook.com) or bruno09213 on discord
 
 ## What CyberBot stores
 
@@ -73,7 +73,7 @@ We do not sell data, show ads or use the data for anything else.
 
 ## Where it is kept
 
-- Case data is in a database file on the machine that hosts the bot, and the blacklist is a JSON file next to it. **[Describe your hosting and backups here if you want to.]**
+- Case data is in a database file on the machine that hosts the bot, and the blacklist is a JSON file next to it. 
 - Evidence images and case posts are in a private Discord forum that only reviewers can access.
 - Access to the host and to the forum is limited to the bot's owner and reviewers.
 
