@@ -91,6 +91,21 @@ HONEYPOT_PHRASES = {
 }
 
 
+CHAT_VICTIM = "victim"
+CHAT_GENERAL = "general"
+CHAT_BULLYING = "cyberbullying"
+CHAT_MODE_LABELS = {
+    CHAT_VICTIM: "I was scammed / I'm a victim",
+    CHAT_GENERAL: "General question",
+    CHAT_BULLYING: "Cyberbullying help",
+}
+CHAT_OPEN = "open"
+CHAT_CLOSED = "closed"
+CHAT_LIMIT_PER_DAY = 3
+CHAT_IDLE_DAYS = 7
+CHAT_PRIVATE_PREFIX = "//"  # a reviewer message starting with this is a private note, not sent
+
+
 def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -165,6 +180,37 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     honeypot_channel_id INTEGER,
     honeypot_action TEXT NOT NULL DEFAULT 'kick',
     honeypot_notice_message_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    anonymous INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    last_activity INTEGER NOT NULL,
+    closed_at INTEGER,
+    closed_by TEXT,
+    thread_id INTEGER,
+    starter_message_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_chats_thread ON chats(thread_id);
+CREATE TABLE IF NOT EXISTS chat_blocks (
+    user_id INTEGER PRIMARY KEY,
+    blocked_by INTEGER,
+    blocked_at INTEGER NOT NULL,
+    reason TEXT
+);
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS server_invites (
+    guild_id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL,
+    channel_id INTEGER,
+    created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS autoban_guilds (
     guild_id INTEGER PRIMARY KEY,
@@ -819,3 +865,196 @@ def describe_results(results: Iterable[ActionResult]) -> str:
         label = ACTION_LABELS.get(r.action, r.action)
         lines.append(f"{'✅' if r.ok else '❌'} **{label}** — {r.detail}")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------------------
+# Help chats (ticket-style: the user DMs the bot, a reviewer answers in a forum post)
+# ------------------------------------------------------------------------------
+CHAT_COLUMNS = {
+    "user_id", "mode", "anonymous", "status", "created_at", "last_activity",
+    "closed_at", "closed_by", "thread_id", "starter_message_id",
+}
+
+
+def chat_mode_label(mode: Optional[str]) -> str:
+    return CHAT_MODE_LABELS.get(mode or "", CHAT_MODE_LABELS[CHAT_GENERAL])
+
+
+def create_chat(user_id: int, mode: str, anonymous: bool = False) -> int:
+    if mode not in CHAT_MODE_LABELS:
+        raise ValueError(f"Unknown chat mode: {mode!r}")
+    now = int(time.time())
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO chats (user_id, mode, anonymous, created_at, last_activity) VALUES (?, ?, ?, ?, ?)",
+            (user_id, mode, 1 if anonymous else 0, now, now),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_chat(chat_id: int, **fields) -> None:
+    if not fields:
+        return
+    unknown = set(fields) - CHAT_COLUMNS
+    if unknown:
+        raise ValueError(f"Unknown chat columns: {sorted(unknown)}")
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with closing(connect()) as conn:
+        conn.execute(f"UPDATE chats SET {assignments} WHERE id = ?", (*fields.values(), chat_id))
+        conn.commit()
+
+
+def touch_chat(chat_id: int) -> None:
+    update_chat(chat_id, last_activity=int(time.time()))
+
+
+def get_chat(chat_id: int) -> Optional[sqlite3.Row]:
+    with closing(connect()) as conn:
+        return conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+
+
+def open_chat_for_user(user_id: int) -> Optional[sqlite3.Row]:
+    with closing(connect()) as conn:
+        return conn.execute(
+            "SELECT * FROM chats WHERE user_id = ? AND status = ? ORDER BY id DESC LIMIT 1",
+            (user_id, CHAT_OPEN),
+        ).fetchone()
+
+
+def chat_for_thread(thread_id: int) -> Optional[sqlite3.Row]:
+    with closing(connect()) as conn:
+        return conn.execute("SELECT * FROM chats WHERE thread_id = ?", (thread_id,)).fetchone()
+
+
+def chats_in_last(user_id: int, seconds: int) -> int:
+    cutoff = int(time.time()) - seconds
+    with closing(connect()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM chats WHERE user_id = ? AND created_at >= ?", (user_id, cutoff)
+        ).fetchone()
+        return int(row["n"])
+
+
+def idle_open_chats(idle_seconds: int) -> list[sqlite3.Row]:
+    cutoff = int(time.time()) - idle_seconds
+    with closing(connect()) as conn:
+        return conn.execute(
+            "SELECT * FROM chats WHERE status = ? AND last_activity < ?", (CHAT_OPEN, cutoff)
+        ).fetchall()
+
+
+def close_chat(chat_id: int, closed_by: str) -> bool:
+    """Returns False if it was already closed (so two closers can't both announce it)."""
+    with closing(connect()) as conn:
+        cur = conn.execute(
+            "UPDATE chats SET status = ?, closed_at = ?, closed_by = ? WHERE id = ? AND status = ?",
+            (CHAT_CLOSED, int(time.time()), closed_by, chat_id, CHAT_OPEN),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def block_chat_user(user_id: int, by: Optional[int] = None, reason: str = "") -> None:
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT INTO chat_blocks (user_id, blocked_by, blocked_at, reason) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO NOTHING",
+            (user_id, by, int(time.time()), reason),
+        )
+        conn.commit()
+
+
+def unblock_chat_user(user_id: int) -> bool:
+    with closing(connect()) as conn:
+        cur = conn.execute("DELETE FROM chat_blocks WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def chat_user_blocked(user_id: int) -> bool:
+    with closing(connect()) as conn:
+        return conn.execute("SELECT 1 FROM chat_blocks WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+
+def get_kv(key: str, default: Optional[str] = None) -> Optional[str]:
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else default
+
+
+def set_kv(key: str, value: Optional[str]) -> None:
+    with closing(connect()) as conn:
+        if value is None:
+            conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        conn.commit()
+
+
+def chat_away_message() -> Optional[str]:
+    """The text shown to people who open a chat while the reviewer is away, or None if available."""
+    return get_kv("chat_away") or None
+
+
+def chat_title(chat_id: int, mode: str, anonymous: bool, name: Optional[str] = None) -> str:
+    if anonymous:
+        return f"Anonymous chat #{chat_id} – {chat_mode_label(mode)}"[:100]
+    return f"Chat #{chat_id} – {name or 'user'} – {chat_mode_label(mode)}"[:100]
+
+
+def chat_receipt_text(chat_id: int, anonymous: bool, away: Optional[str] = None) -> str:
+    text = (
+        f"Your chat **#{chat_id}** is open. A real person reads these and will reply here, "
+        "but not instantly, so please be patient. Anything you send me in this DM is passed along."
+    )
+    if anonymous:
+        text += " Your name and ID are hidden from the people reading the chat, but the bot still knows who you are so it can reply to you."
+    text += "\n\nType `close` any time to end the chat."
+    if away:
+        text += f"\n\n⏳ {away}"
+    return text
+
+
+def chat_closed_text(chat_id: int, closed_by: str) -> str:
+    why = {
+        "reviewer": "A reviewer closed it.",
+        "user": "You closed it.",
+        "idle": f"It was closed after {CHAT_IDLE_DAYS} days without messages.",
+    }.get(closed_by, "")
+    return f"Chat #{chat_id} is closed. {why} You can open a new one any time by sending me a message.".replace("  ", " ")
+
+
+# ------------------------------------------------------------------------------
+# Server invites (so the same invite is reused instead of creating a new one each time)
+# ------------------------------------------------------------------------------
+def get_server_invite(guild_id: int) -> Optional[sqlite3.Row]:
+    with closing(connect()) as conn:
+        return conn.execute("SELECT * FROM server_invites WHERE guild_id = ?", (guild_id,)).fetchone()
+
+
+def save_server_invite(guild_id: int, code: str, channel_id: Optional[int] = None) -> None:
+    with closing(connect()) as conn:
+        conn.execute(
+            "INSERT INTO server_invites (guild_id, code, channel_id, created_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET code = excluded.code, channel_id = excluded.channel_id, "
+            "created_at = excluded.created_at",
+            (guild_id, code, channel_id, int(time.time())),
+        )
+        conn.commit()
+
+
+def forget_server_invite(guild_id: int) -> None:
+    with closing(connect()) as conn:
+        conn.execute("DELETE FROM server_invites WHERE guild_id = ?", (guild_id,))
+        conn.commit()
+
+
+def invite_usable(max_age: int, max_uses: int, uses: int, temporary: bool) -> bool:
+    """An existing invite is worth reusing only if it never expires, has no use limit left to run out, and isn't temporary."""
+    if temporary or max_age != 0:
+        return False
+    return max_uses == 0 or uses < max_uses
