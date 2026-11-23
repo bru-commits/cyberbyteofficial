@@ -20,7 +20,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Forum channel where every report becomes its own post
-REVIEW_FORUM_ID = core.env_int("REVIEW_FORUM_ID", 1561374020769812561)
+REVIEW_FORUM_ID = core.env_int("REVIEW_FORUM_ID")  # required, set it in .env
 # Forum channel for help chats (optional; defaults to the review forum)
 HELP_FORUM_ID = core.env_int("HELP_FORUM_ID")
 # Server where bans are applied (defaults to the server that owns the review forum)
@@ -94,6 +94,8 @@ def is_bot_owner():
 
 
 async def get_review_forum() -> Optional[discord.ForumChannel]:
+    if REVIEW_FORUM_ID is None:
+        return None
     channel = bot.get_channel(REVIEW_FORUM_ID)
     if channel is None:
         try:
@@ -1239,7 +1241,7 @@ class DiscordActionIO:
     def guild(self) -> Optional[discord.Guild]:
         if ACTION_GUILD_ID:
             return bot.get_guild(ACTION_GUILD_ID)
-        forum = bot.get_channel(REVIEW_FORUM_ID)
+        forum = bot.get_channel(REVIEW_FORUM_ID) if REVIEW_FORUM_ID else None
         return forum.guild if forum is not None else None
 
     def unavailable_reason(self, action: str, user_id: Optional[int] = None) -> Optional[str]:
@@ -2491,7 +2493,10 @@ async def case_cmd(interaction: discord.Interaction, case_id: int):
 async def startup_checks():
     forum = await get_review_forum()
     if forum is None:
-        print(f"⚠️ Review forum {REVIEW_FORUM_ID} not found or not a forum channel. Reports can't be filed.")
+        print(
+            f"⚠️ Review forum ({REVIEW_FORUM_ID or 'REVIEW_FORUM_ID is not set'}) not found "
+            "or not a forum channel. Reports can't be filed."
+        )
     else:
         perms = forum.permissions_for(forum.guild.me)
         needed = [
