@@ -8,7 +8,7 @@ from typing import Optional, Union
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import cyberbot_core as core
@@ -20,7 +20,9 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Forum channel where every report becomes its own post
-REVIEW_FORUM_ID = core.env_int("REVIEW_FORUM_ID")  # required, set it in .env
+REVIEW_FORUM_ID = core.env_int("REVIEW_FORUM_ID", 1561374020769812561)
+# Forum channel for help chats (optional; defaults to the review forum)
+HELP_FORUM_ID = core.env_int("HELP_FORUM_ID")
 # Server where bans are applied (defaults to the server that owns the review forum)
 ACTION_GUILD_ID = core.env_int("CYBERBYTE_GUILD_ID")
 # Channel for public warnings (optional; the option is refused if unset)
@@ -30,7 +32,7 @@ REVIEWER_ROLE_ID = core.env_int("REVIEWER_ROLE_ID")
 # Optional: replaces the default appeal instructions in the DM people get. Leave it unset to
 # use the built-in text, which points at the Appeal button.
 APPEAL_TEXT = os.getenv("APPEAL_TEXT") or None
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.2.0"
 
 ALERT_CHANNEL_NAME = "cyberbot-alerts"
 HONEYPOT_CHANNEL_NAME = core.DEFAULT_HONEYPOT_NAME
@@ -69,8 +71,9 @@ class CyberBot(commands.Bot):
         core.init_db()
         # Case-panel buttons carry the case number in their custom_id, so they
         # keep working after a restart without re-registering every case.
-        self.add_dynamic_items(CaseButton, AppealButton, AppealReviewButton)
+        self.add_dynamic_items(CaseButton, AppealButton, AppealReviewButton, ChatButton)
         load_honeypot_cache()
+        chat_idle_loop.start()
         try:
             synced = await self.tree.sync()
             print(f"⚡ Synced {len(synced)} application command(s).")
@@ -91,8 +94,6 @@ def is_bot_owner():
 
 
 async def get_review_forum() -> Optional[discord.ForumChannel]:
-    if REVIEW_FORUM_ID is None:
-        return None
     channel = bot.get_channel(REVIEW_FORUM_ID)
     if channel is None:
         try:
@@ -893,14 +894,18 @@ async def handle_reporter_dm(message: discord.Message):
         await message.channel.send(answer)
         return
 
+    chat = core.open_chat_for_user(message.author.id)
+    if chat is not None and await handle_chat_dm(message, chat):
+        return
+
     cases = core.open_cases_for_reporter(message.author.id)
     ref, body = core.parse_case_ref(message.content or "")
 
     if not cases:
         last = _help_sent.get(message.author.id, 0.0)
-        if time.time() - last > 3600:
+        if time.time() - last > 600:
             _help_sent[message.author.id] = time.time()
-            await message.channel.send(HELP_TEXT)
+            await offer_chat_menu(message)
         return
 
     if ref is not None:
@@ -1234,7 +1239,7 @@ class DiscordActionIO:
     def guild(self) -> Optional[discord.Guild]:
         if ACTION_GUILD_ID:
             return bot.get_guild(ACTION_GUILD_ID)
-        forum = bot.get_channel(REVIEW_FORUM_ID) if REVIEW_FORUM_ID else None
+        forum = bot.get_channel(REVIEW_FORUM_ID)
         return forum.guild if forum is not None else None
 
     def unavailable_reason(self, action: str, user_id: Optional[int] = None) -> Optional[str]:
@@ -1938,6 +1943,442 @@ async def appeal_cmd(
 
 
 # ------------------------------------------------------------------------------
+# 9c. HELP CHATS (ticket-style: the user DMs the bot, a reviewer answers in a forum post)
+# ------------------------------------------------------------------------------
+CHAT_CHOICES = [
+    (core.CHAT_VICTIM, False, "I was scammed", "🆘"),
+    (core.CHAT_GENERAL, False, "General question", "❓"),
+    (core.CHAT_BULLYING, False, "Cyberbullying help", "🛡️"),
+    (core.CHAT_BULLYING, True, "Cyberbullying (anonymous)", "🕶️"),
+]
+CHAT_PICK_TEXT = (
+    "**What do you need help with?** Pick one. A real person reads these and replies when they can, "
+    "so it won't be instant. The anonymous option hides your name and ID from the people reading the chat."
+)
+CHAT_INFLIGHT: set = set()
+_chat_notify_failed = False
+
+
+async def get_help_forum() -> Optional[discord.ForumChannel]:
+    forum_id = HELP_FORUM_ID or REVIEW_FORUM_ID
+    if forum_id is None:
+        return None
+    channel = bot.get_channel(forum_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(forum_id)
+        except discord.HTTPException:
+            return None
+    return channel if isinstance(channel, discord.ForumChannel) else None
+
+
+def chat_embed(chat) -> discord.Embed:
+    is_open = chat["status"] == core.CHAT_OPEN
+    embed = discord.Embed(
+        title=f"Chat #{chat['id']} — {'Open' if is_open else 'Closed'}",
+        color=0x3498DB if is_open else 0x95A5A6,
+        timestamp=utc(chat["created_at"]),
+    )
+    embed.add_field(name="Mode", value=core.chat_mode_label(chat["mode"]), inline=True)
+    if chat["anonymous"]:
+        who = "🕶️ Anonymous\nName and ID are hidden here."
+    else:
+        who = f"<@{chat['user_id']}>\nID `{chat['user_id']}`"
+    embed.add_field(name="Who", value=who, inline=True)
+    if is_open:
+        embed.description = (
+            "Reply in this post and I'll send it to them. Start a message with `//` to write a private "
+            "note that is **not** sent. Press **Close chat** when you're done."
+        )
+    else:
+        embed.add_field(name="Closed", value=f"<t:{chat['closed_at'] or 0}:f> ({chat['closed_by'] or '—'})", inline=False)
+    embed.set_footer(text="CyberBot help chat")
+    return embed
+
+
+CHAT_BUTTONS = {
+    "close": ("Close chat", discord.ButtonStyle.secondary, "🔒"),
+    "block": ("Close & block user", discord.ButtonStyle.danger, "🚫"),
+}
+
+
+class ChatButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"cc:(?P<action>close|block):(?P<chat_id>\d+)",
+):
+    def __init__(self, action: str, chat_id: int, *, disabled: bool = False):
+        label, style, emoji = CHAT_BUTTONS[action]
+        super().__init__(
+            discord.ui.Button(
+                label=label, style=style, emoji=emoji,
+                custom_id=f"cc:{action}:{chat_id}", disabled=disabled,
+            )
+        )
+        self.action = action
+        self.chat_id = chat_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"], int(match["chat_id"]))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await user_is_reviewer(interaction.user):
+            await interaction.response.send_message("❌ Only reviewers can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction):
+        chat = core.get_chat(self.chat_id)
+        if chat is None or chat["status"] != core.CHAT_OPEN:
+            await interaction.response.send_message("This chat is already closed.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        if self.action == "block":
+            core.block_chat_user(chat["user_id"], interaction.user.id)
+        await end_chat(self.chat_id, "reviewer", interaction.user)
+        text = "✅ Chat closed." if self.action == "close" else "✅ Chat closed and the user can't open new chats."
+        await interaction.followup.send(text, ephemeral=True)
+
+
+def build_chat_view(chat_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for action in ("close", "block"):
+        view.add_item(ChatButton(action, chat_id, disabled=disabled))
+    return view
+
+
+async def refresh_chat_ui(chat_id: int) -> None:
+    chat = core.get_chat(chat_id)
+    thread = await get_thread(chat["thread_id"]) if chat is not None else None
+    if thread is None:
+        return
+    closed = chat["status"] != core.CHAT_OPEN
+    try:
+        await thread.get_partial_message(chat["starter_message_id"]).edit(
+            embed=chat_embed(chat), view=build_chat_view(chat_id, disabled=closed)
+        )
+    except discord.HTTPException as exc:
+        print(f"⚠️ Could not refresh chat #{chat_id}: {exc}")
+    if closed:
+        try:
+            await thread.edit(archived=True, locked=True)
+        except discord.HTTPException as exc:
+            print(f"⚠️ Could not lock chat #{chat_id}: {exc}")
+
+
+async def end_chat(chat_id: int, closed_by: str, actor=None, notify_user: bool = True) -> bool:
+    """Closes a chat, tells the user and locks the post. Returns False if it was already closed."""
+    if not core.close_chat(chat_id, closed_by):
+        return False
+    chat = core.get_chat(chat_id)
+    thread = await get_thread(chat["thread_id"])
+    if thread is not None:
+        who = {
+            "reviewer": f"by {actor.mention}" if actor is not None else "by a reviewer",
+            "user": "by the user",
+            "idle": f"after {core.CHAT_IDLE_DAYS} days without messages",
+        }.get(closed_by, "")
+        try:
+            await thread.send(
+                embed=discord.Embed(title="🔒 Chat closed", description=f"Closed {who}.", color=0x95A5A6),
+                allowed_mentions=NO_MENTIONS,
+            )
+        except discord.HTTPException as exc:
+            print(f"⚠️ Could not log closing of chat #{chat_id}: {exc}")
+    if notify_user:
+        await dm_user(chat["user_id"], content=core.chat_closed_text(chat_id, closed_by))
+    await refresh_chat_ui(chat_id)
+    return True
+
+
+async def notify_owner(text: str) -> None:
+    global _chat_notify_failed
+    try:
+        owner = (await bot.application_info()).owner
+        await owner.send(text)
+    except Exception as exc:
+        if not _chat_notify_failed:
+            _chat_notify_failed = True
+            print(f"ℹ️ Couldn't DM the bot owner about new chats: {exc}")
+
+
+async def start_chat(user, mode: str, anonymous: bool, text: str, attachments: list) -> tuple:
+    """Opens a chat forum post. Returns (ok, message for the person)."""
+    if user.id in CHAT_INFLIGHT:
+        return False, "Your chat is already being opened."
+    CHAT_INFLIGHT.add(user.id)
+    try:
+        if core.chat_user_blocked(user.id):
+            return False, "❌ I can't open a chat for you right now."
+        existing = core.open_chat_for_user(user.id)
+        if existing is not None:
+            return False, f"You already have chat #{existing['id']} open. Just send your messages to me here and I'll pass them along."
+        if core.chats_in_last(user.id, 86400) >= core.CHAT_LIMIT_PER_DAY:
+            return False, "❌ You've opened several chats today. Please wait a while before opening another."
+        forum = await get_help_forum()
+        if forum is None:
+            return False, "❌ I can't reach the review team right now. Please try again a bit later."
+
+        chat_id = core.create_chat(user.id, mode, anonymous)
+        chat = core.get_chat(chat_id)
+        kwargs = dict(
+            name=core.chat_title(chat_id, mode, anonymous, getattr(user, "name", None)),
+            auto_archive_duration=core.THREAD_ARCHIVE_MINUTES,
+            embed=chat_embed(chat),
+            view=build_chat_view(chat_id),
+            allowed_mentions=NO_MENTIONS,
+        )
+        tags = _tags_named(forum, ["chat", mode if mode != core.CHAT_BULLYING else "cyberbullying"])
+        if not tags and forum.flags.require_tag and forum.available_tags:
+            tags = [forum.available_tags[0]]
+        try:
+            try:
+                created = await forum.create_thread(applied_tags=tags[:5], **kwargs) if tags else await forum.create_thread(**kwargs)
+            except discord.HTTPException:
+                if not tags:
+                    raise
+                kwargs["view"] = build_chat_view(chat_id)
+                created = await forum.create_thread(**kwargs)  # e.g. a tag is moderator-only
+        except discord.HTTPException as exc:
+            print(f"❌ Could not create the post for chat #{chat_id}: {exc}")
+            core.close_chat(chat_id, "error")
+            return False, "❌ I couldn't open your chat right now. Please try again a bit later."
+        thread = created.thread
+        core.update_chat(chat_id, thread_id=thread.id, starter_message_id=created.message.id)
+
+        await post_chat_message(thread, chat, text, attachments, first=True)
+        away = core.chat_away_message()
+        dm_error = await dm_user(user.id, content=core.chat_receipt_text(chat_id, anonymous, away))
+        if dm_error:
+            try:
+                await thread.send(
+                    content=f"⚠️ I couldn't DM the user ({dm_error}), so I can't reply to them. Closing this chat.",
+                    allowed_mentions=NO_MENTIONS,
+                )
+            except discord.HTTPException:
+                pass
+            await end_chat(chat_id, "error", notify_user=False)
+            return False, f"❌ I couldn't DM you ({dm_error}). Turn on DMs from server members or message me directly, then try again."
+        await notify_owner(f"💬 New {'anonymous ' if anonymous else ''}chat #{chat_id}: {core.chat_mode_label(mode)}")
+        return True, (
+            f"✅ Chat #{chat_id} is open. I've sent you a DM: keep talking to me there. "
+            "A real person will reply when they can."
+        )
+    finally:
+        CHAT_INFLIGHT.discard(user.id)
+
+
+async def post_chat_message(thread: discord.Thread, chat, text: str, attachments: list, first: bool = False) -> list:
+    """Posts something the user said into the chat post. Returns notes about files that weren't copied."""
+    who = "anonymous user" if chat["anonymous"] else "user"
+    embed = discord.Embed(
+        title=f"💬 {'First message' if first else 'Message'} from the {who}",
+        description=core.code_block(text, 3800) if text else "(attachments only)",
+        color=0xF1C40F,
+        timestamp=now(),
+    )
+    await thread.send(embed=embed, allowed_mentions=NO_MENTIONS)
+    notes = []
+    if attachments:
+        copyable = [a for a in attachments if is_rehostable(a)]
+        notes = [f"{a.filename} (not an image)" for a in attachments if not is_rehostable(a)]
+        if copyable:
+            forum = await get_help_forum()
+            limit = forum.guild.filesize_limit if forum is not None else 8 * 1024 * 1024
+            notes += await post_files(thread, copyable, "**Images from the user (re-hosted):**", limit)
+        if notes:
+            await thread.send(content="⚠️ Not copied: " + ", ".join(notes), allowed_mentions=NO_MENTIONS)
+    return notes
+
+
+async def relay_user_chat_message(chat, message: discord.Message) -> None:
+    thread = await get_thread(chat["thread_id"])
+    if thread is None:
+        await message.channel.send("I can't find your chat right now. Please try again a bit later.")
+        return
+    try:
+        await post_chat_message(thread, chat, (message.content or "").strip(), list(message.attachments))
+    except discord.HTTPException as exc:
+        await message.channel.send(f"I couldn't pass that on (Discord error {exc.status}). Please try again.")
+        return
+    core.touch_chat(chat["id"])
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+
+
+async def handle_reviewer_chat_message(message: discord.Message) -> None:
+    """A reviewer wrote in a chat post: send it to the user."""
+    chat = core.chat_for_thread(message.channel.id)
+    if chat is None or not await user_is_reviewer(message.author):
+        return
+    text = (message.content or "").strip()
+    if text.startswith(core.CHAT_PRIVATE_PREFIX):
+        return  # a private note
+    if chat["status"] != core.CHAT_OPEN:
+        try:
+            await message.add_reaction("🔒")
+        except discord.HTTPException:
+            pass
+        return
+    if not text and not message.attachments:
+        return
+    embed = discord.Embed(
+        title=f"Reply from {core.COMMUNITY_NAME}",
+        description=core.clip(text, 4000) if text else "(see the attachment below)",
+        color=0x3498DB,
+        timestamp=now(),
+    )
+    embed.set_footer(text=f"Chat #{chat['id']} • type close to end the chat")
+    error = await dm_user(chat["user_id"], embed=embed)
+    notes = []
+    if not error and message.attachments:
+        try:
+            user = bot.get_user(chat["user_id"]) or await bot.fetch_user(chat["user_id"])
+            dm = await user.create_dm()
+            copyable = [a for a in message.attachments if is_rehostable(a)]
+            notes = [f"{a.filename} (not an image)" for a in message.attachments if not is_rehostable(a)]
+            if copyable:
+                notes += await post_files(dm, copyable, "📎 Attachment from the reviewer:", 8 * 1024 * 1024)
+        except discord.HTTPException as exc:
+            notes.append(f"attachments failed ({exc.status})")
+    core.touch_chat(chat["id"])
+    try:
+        await message.add_reaction("⚠️" if error else "✅")
+    except discord.HTTPException:
+        pass
+    if error or notes:
+        detail = f"Couldn't deliver this: {error}." if error else "Not sent: " + ", ".join(notes)
+        try:
+            await message.channel.send(f"⚠️ {detail}", allowed_mentions=NO_MENTIONS)
+        except discord.HTTPException:
+            pass
+
+
+async def handle_chat_dm(message: discord.Message, chat) -> bool:
+    """Handles a DM from someone with an open chat. Returns True if the message was used."""
+    text = (message.content or "").strip()
+    if text.lower() in ("close", "close chat"):
+        await end_chat(chat["id"], "user")
+        return True
+    ref, _body = core.parse_case_ref(text)
+    if ref is not None:
+        return False  # "#12 ..." is meant for a report
+    await relay_user_chat_message(chat, message)
+    return True
+
+
+class ChatModal(discord.ui.Modal):
+    def __init__(self, mode: str, anonymous: bool):
+        super().__init__(title=f"Chat: {core.chat_mode_label(mode)}"[:45])
+        self.mode = mode
+        self.anonymous = anonymous
+        self.text = discord.ui.TextInput(
+            label="What's going on?",
+            style=discord.TextStyle.paragraph,
+            placeholder="Tell me what happened or what you'd like to ask.",
+            required=True,
+            max_length=1500,
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        _ok, text = await start_chat(interaction.user, self.mode, self.anonymous, self.text.value.strip(), [])
+        await interaction.followup.send(text, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        await reply(interaction, "❌ Something went wrong while opening your chat.")
+
+
+class ChatModeView(discord.ui.View):
+    """Lets someone pick what kind of chat to open. If they already wrote a message, it becomes the first one."""
+
+    def __init__(self, user_id: int, first_text: str = "", attachments: Optional[list] = None):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.first_text = first_text
+        self.attachments = attachments or []
+        for mode, anonymous, label, emoji in CHAT_CHOICES:
+            button = discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+            button.callback = self._opener(mode, anonymous)
+            self.add_item(button)
+
+    def _opener(self, mode: str, anonymous: bool):
+        async def pick(interaction: discord.Interaction):
+            if self.first_text or self.attachments:
+                await interaction.response.defer()
+                _ok, text = await start_chat(interaction.user, mode, anonymous, self.first_text, self.attachments)
+                await interaction.edit_original_response(content=text, view=None)
+                self.stop()
+            else:
+                await interaction.response.send_modal(ChatModal(mode, anonymous))
+        return pick
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This menu belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+
+async def offer_chat_menu(message: discord.Message) -> None:
+    if core.chat_user_blocked(message.author.id):
+        await message.channel.send(HELP_TEXT)
+        return
+    view = ChatModeView(message.author.id, (message.content or "").strip(), list(message.attachments))
+    await message.channel.send(
+        HELP_TEXT + "\n\n" + CHAT_PICK_TEXT + "\n*(Your message will be sent as the first message.)*", view=view
+    )
+
+
+@bot.tree.command(name="help", description="Talk to a real person about a scam, cyberbullying or a question.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def help_cmd(interaction: discord.Interaction):
+    if core.chat_user_blocked(interaction.user.id):
+        await interaction.response.send_message("❌ I can't open a chat for you right now.", ephemeral=True)
+        return
+    existing = core.open_chat_for_user(interaction.user.id)
+    if existing is not None:
+        await interaction.response.send_message(
+            f"You already have chat #{existing['id']} open. Send your messages to me in DMs, or type `close` there to end it.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        CHAT_PICK_TEXT, view=ChatModeView(interaction.user.id), ephemeral=True
+    )
+
+
+@bot.tree.command(name="help-status", description="[Owner Only] Set or clear the 'I'm away' note shown to new chats.")
+@app_commands.describe(away="Message to show (e.g. 'Away until Monday'). Leave empty to mark yourself available.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@is_bot_owner()
+async def help_status(interaction: discord.Interaction, away: Optional[app_commands.Range[str, 1, 300]] = None):
+    core.set_kv("chat_away", away.strip() if away else None)
+    await interaction.response.send_message(
+        f"✅ New chats will be told: {away}" if away else "✅ You're marked as available.", ephemeral=True
+    )
+
+
+@tasks.loop(hours=1)
+async def chat_idle_loop():
+    for chat in core.idle_open_chats(core.CHAT_IDLE_DAYS * 86400):
+        try:
+            await end_chat(chat["id"], "idle")
+        except Exception:
+            traceback.print_exc()
+
+
+@chat_idle_loop.before_loop
+async def _before_chat_idle_loop():
+    await bot.wait_until_ready()
+
+
+# ------------------------------------------------------------------------------
 # 10. /cases LOOKUP
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="cases", description="[Reviewer] Show the case history for a user ID.")
@@ -2050,10 +2491,7 @@ async def case_cmd(interaction: discord.Interaction, case_id: int):
 async def startup_checks():
     forum = await get_review_forum()
     if forum is None:
-        print(
-            f"⚠️ Review forum ({REVIEW_FORUM_ID or 'REVIEW_FORUM_ID is not set'}) not found "
-            "or not a forum channel. Reports can't be filed."
-        )
+        print(f"⚠️ Review forum {REVIEW_FORUM_ID} not found or not a forum channel. Reports can't be filed.")
     else:
         perms = forum.permissions_for(forum.guild.me)
         needed = [
@@ -2685,6 +3123,72 @@ async def security_status(interaction: discord.Interaction):
 
 
 # ------------------------------------------------------------------------------
+# 12b. SERVER LINKS (reuses invites instead of creating a new one every time)
+# ------------------------------------------------------------------------------
+async def invite_for_guild(guild: discord.Guild) -> tuple:
+    """Returns (url or None, note). Reuses a saved or existing invite before creating one."""
+    stored = core.get_server_invite(guild.id)
+    if stored is not None:
+        try:
+            invite = await bot.fetch_invite(stored["code"])
+            if invite.guild is not None and invite.guild.id == guild.id:
+                return f"https://discord.gg/{stored['code']}", "saved invite"
+            core.forget_server_invite(guild.id)
+        except discord.NotFound:
+            core.forget_server_invite(guild.id)  # expired or deleted
+        except discord.HTTPException:
+            return f"https://discord.gg/{stored['code']}", "saved invite (couldn't re-check it)"
+
+    me = guild.me
+    if me is not None and me.guild_permissions.manage_guild:
+        try:
+            existing = await guild.invites()
+        except discord.HTTPException:
+            existing = []
+        usable = [i for i in existing if core.invite_usable(i.max_age or 0, i.max_uses or 0, i.uses or 0, bool(i.temporary))]
+        usable.sort(key=lambda i: (i.inviter is None or i.inviter.id != bot.user.id, -(i.uses or 0)))
+        if usable:
+            core.save_server_invite(guild.id, usable[0].code, usable[0].channel.id if usable[0].channel else None)
+            return usable[0].url, "existing invite"
+
+    candidates = [c for c in (guild.system_channel, guild.rules_channel, *guild.text_channels) if c is not None]
+    for channel in candidates:
+        if not channel.permissions_for(me).create_instant_invite:
+            continue
+        try:
+            invite = await channel.create_invite(max_age=0, max_uses=0, unique=False, reason="CyberBot server link")
+        except discord.HTTPException:
+            continue
+        core.save_server_invite(guild.id, invite.code, channel.id)
+        return invite.url, "new invite"
+    return None, "I don't have permission to create invites there"
+
+
+@bot.tree.command(name="server-links", description="[Owner Only] Get an invite link for every server I'm in (reuses existing ones).")
+@app_commands.allowed_installs(guilds=True, users=False)
+@is_bot_owner()
+async def server_links(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines = []
+    for guild in sorted(bot.guilds, key=lambda g: g.name.lower()):
+        url, note = await invite_for_guild(guild)
+        head = f"**{discord.utils.escape_markdown(guild.name)}** (`{guild.id}`, {guild.member_count or '?'} members)"
+        lines.append(f"{head}: {url} *({note})*" if url else f"{head}: ❌ {note}")
+        await asyncio.sleep(0.3)
+    if not lines:
+        await interaction.followup.send("I'm not in any servers.", ephemeral=True)
+        return
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 1900:
+            await interaction.followup.send(chunk, ephemeral=True, suppress_embeds=True)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await interaction.followup.send(chunk, ephemeral=True, suppress_embeds=True)
+
+
+# ------------------------------------------------------------------------------
 # 13. MESSAGE EVENTS (reporter DMs + honeypot trap)
 # ------------------------------------------------------------------------------
 @bot.event
@@ -2695,6 +3199,13 @@ async def on_message(message: discord.Message):
     if message.guild is None:
         try:
             await handle_reporter_dm(message)
+        except Exception:
+            traceback.print_exc()
+        return
+
+    if isinstance(message.channel, discord.Thread) and message.channel.parent_id in (REVIEW_FORUM_ID, HELP_FORUM_ID):
+        try:
+            await handle_reviewer_chat_message(message)
         except Exception:
             traceback.print_exc()
         return
